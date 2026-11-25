@@ -28,6 +28,7 @@ setup(
             'topic_sub = m0609.topic_subscriber:main',
             'service_server = m0609.service_server:main',
             'service_client = m0609.service_client:main',
+            'm0609_color_detector = m0609.m0609_color_detector:main',
         ],
     },
 )
