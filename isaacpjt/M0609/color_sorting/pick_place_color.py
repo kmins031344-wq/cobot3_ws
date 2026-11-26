@@ -7,6 +7,13 @@
        1 = 파랑 -> 파란 마커 위치, 2 = 초록 -> 초록 마커 위치
   4. 집어서 같은 색 마커 위에 놓는다
 
+ROS2 발행 토픽 (R1 + R2 적용, Play 중)
+  /clock        rosgraph_msgs/Clock     시뮬레이션 시간 (R1 Clock Graph)
+  /rgb          sensor_msgs/Image       손목 D455 컬러 카메라 -> PC B 색 감지에 쓰임 (R2)
+  /depth        sensor_msgs/Image       같은 카메라의 깊이 영상 (R2)
+  /camera_info  sensor_msgs/CameraInfo  카메라 내부 파라미터 (R2)
+  /rgb_left     sensor_msgs/Image       D455 왼쪽 카메라 (R2 연습 문제: 두 눈으로 보기)
+
 랜덤 위치를 고르는 방법 (IK 없이 L7 의 관절 자세를 그대로 쓰기 위해)
   로봇에서의 거리는 0.45 m 로 고정하고 방향(yaw)만 랜덤으로 고른다.
   -> joint_1 만 그 방향으로 돌리면 L7 의 ABOVE/PICK 자세를 그대로 쓸 수 있다.
@@ -79,7 +86,14 @@ COLORS = {
 }
 
 # 손목 카메라 -> ROS2
+D455_PRIM = f"{ROBOT_PRIM}/angle_bracket/realsense_d455/RSD455"
+CAMERA_LEFT_PRIM = f"{D455_PRIM}/Camera_OmniVision_OV9782_Left"  # 왼쪽 카메라 -> /rgb_left (R2 연습 문제)
+CLOCK_GRAPH_PATH = "/World/Graph/ROS_Clock"      # R1 과 같은 위치
+CAMERA_GRAPH_PATH = "/World/Graph/camera_graph"  # R2 와 같은 위치
 RGB_TOPIC = "rgb"                   # 토픽 이름 (/rgb)
+DEPTH_TOPIC = "depth"               # /depth
+CAMERA_INFO_TOPIC = "camera_info"   # /camera_info
+RGB_LEFT_TOPIC = "rgb_left"         # /rgb_left
 CAM_WIDTH, CAM_HEIGHT = 320, 240    # 다른 PC 로 보내므로 작게 (네트워크 부담 줄이기)
 CAM_FRAME_SKIP = 5                  # 60 fps 중 5 프레임 건너뛰고 1 장 -> 약 10 Hz
 COLOR_TOPIC = "color_id"            # 결과 토픽 이름 (/color_id)
@@ -251,7 +265,7 @@ class ColorIdListener:
 
 
 # ------------------------------------------------------------
-# (다) 손목 카메라 -> /rgb 발행 (OmniGraph ROS2 카메라 노드)
+# (다) R1 Clock Graph + R2 Camera Graph (손목 카메라 -> /rgb, /depth, /camera_info, /rgb_left)
 # ------------------------------------------------------------
 def find_wrist_camera():
     """로봇 USD 안에서 카메라 prim 을 찾는다 (D455 의 컬러 카메라 우선). 없으면 그리퍼에 하나 만든다"""
@@ -280,37 +294,116 @@ def find_wrist_camera():
     return path
 
 
-def create_camera_graph(camera_path):
-    """Play 중 매 틱마다 카메라 렌더 결과를 /rgb 로 발행하는 Action Graph"""
+def create_clock_graph():
+    """[R1] Play 중 매 틱마다 시뮬레이션 시간을 /clock 으로 발행하는 Action Graph"""
     keys = og.Controller.Keys
     og.Controller.edit(
-        {"graph_path": "/ActionGraph_Camera", "evaluator_name": "execution"},
+        {"graph_path": CLOCK_GRAPH_PATH, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
-                ("OnTick", "omni.graph.action.OnPlaybackTick"),
-                ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
-                ("RGBPublish", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),          # Play 중 매 프레임 실행 신호
+                ("Context", "isaacsim.ros2.bridge.ROS2Context"),                 # ROS2 통신 설정 (Domain ID)
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),  # 시뮬레이션 시간 읽기
+                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),       # 시간을 토픽으로 발행
             ],
             keys.CONNECT: [
-                ("OnTick.outputs:tick", "RenderProduct.inputs:execIn"),
-                ("RenderProduct.outputs:execOut", "RGBPublish.inputs:execIn"),
-                ("RenderProduct.outputs:renderProductPath", "RGBPublish.inputs:renderProductPath"),
+                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                ("Context.outputs:context", "PublishClock.inputs:context"),
+                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
             ],
             keys.SET_VALUES: [
-                ("RenderProduct.inputs:width", CAM_WIDTH),
-                ("RenderProduct.inputs:height", CAM_HEIGHT),
-                ("RGBPublish.inputs:type", "rgb"),
-                ("RGBPublish.inputs:topicName", RGB_TOPIC),
-                ("RGBPublish.inputs:frameId", "wrist_camera"),
-                ("RGBPublish.inputs:frameSkipCount", CAM_FRAME_SKIP),
+                ("PublishClock.inputs:topicName", "clock"),                      # /clock
             ],
         },
     )
+    print("[Clock] Clock Graph 생성:", CLOCK_GRAPH_PATH)
+
+
+def create_camera_graph(camera_path, left_path=None):
+    """[R2] Play 중 손목 카메라를 렌더해서 /rgb, /depth, /camera_info (+ /rgb_left) 로 발행하는 Action Graph
+
+    left_path 가 있으면 연습 문제의 왼쪽 카메라도 /rgb_left 로 함께 발행한다
+    """
+    keys = og.Controller.Keys
+    nodes = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("RenderProduct", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+        ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+        ("CameraInfoPublish", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
+        ("RGBPublish", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+        ("DepthPublish", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+    ]
+    connects = [
+        ("OnPlaybackTick.outputs:tick", "RenderProduct.inputs:execIn"),
+        ("RenderProduct.outputs:execOut", "CameraInfoPublish.inputs:execIn"),
+        ("RenderProduct.outputs:execOut", "RGBPublish.inputs:execIn"),
+        ("RenderProduct.outputs:execOut", "DepthPublish.inputs:execIn"),
+        ("RenderProduct.outputs:renderProductPath", "CameraInfoPublish.inputs:renderProductPath"),
+        ("RenderProduct.outputs:renderProductPath", "RGBPublish.inputs:renderProductPath"),
+        ("RenderProduct.outputs:renderProductPath", "DepthPublish.inputs:renderProductPath"),
+        ("Context.outputs:context", "CameraInfoPublish.inputs:context"),
+        ("Context.outputs:context", "RGBPublish.inputs:context"),
+        ("Context.outputs:context", "DepthPublish.inputs:context"),
+    ]
+    values = [
+        ("RenderProduct.inputs:width", CAM_WIDTH),
+        ("RenderProduct.inputs:height", CAM_HEIGHT),
+        ("CameraInfoPublish.inputs:topicName", CAMERA_INFO_TOPIC),
+        ("CameraInfoPublish.inputs:frameId", "wrist_camera"),
+        ("CameraInfoPublish.inputs:frameSkipCount", CAM_FRAME_SKIP),
+        ("RGBPublish.inputs:type", "rgb"),
+        ("RGBPublish.inputs:topicName", RGB_TOPIC),
+        ("RGBPublish.inputs:frameId", "wrist_camera"),
+        ("RGBPublish.inputs:frameSkipCount", CAM_FRAME_SKIP),
+        ("DepthPublish.inputs:type", "depth"),
+        ("DepthPublish.inputs:topicName", DEPTH_TOPIC),
+        ("DepthPublish.inputs:frameId", "wrist_camera"),
+        ("DepthPublish.inputs:frameSkipCount", CAM_FRAME_SKIP),
+    ]
+    if left_path:  # 연습 문제: 왼쪽 카메라용 RenderProduct 를 하나 더 만들어 /rgb_left 로 발행
+        nodes += [
+            ("RenderProductLeft", "isaacsim.core.nodes.IsaacCreateRenderProduct"),
+            ("RGBLeftPublish", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+        ]
+        connects += [
+            ("OnPlaybackTick.outputs:tick", "RenderProductLeft.inputs:execIn"),
+            ("RenderProductLeft.outputs:execOut", "RGBLeftPublish.inputs:execIn"),
+            ("RenderProductLeft.outputs:renderProductPath", "RGBLeftPublish.inputs:renderProductPath"),
+            ("Context.outputs:context", "RGBLeftPublish.inputs:context"),
+        ]
+        values += [
+            ("RenderProductLeft.inputs:width", CAM_WIDTH),
+            ("RenderProductLeft.inputs:height", CAM_HEIGHT),
+            ("RGBLeftPublish.inputs:type", "rgb"),
+            ("RGBLeftPublish.inputs:topicName", RGB_LEFT_TOPIC),
+            ("RGBLeftPublish.inputs:frameId", "wrist_camera_left"),
+            ("RGBLeftPublish.inputs:frameSkipCount", CAM_FRAME_SKIP),
+        ]
+
+    og.Controller.edit(
+        {"graph_path": CAMERA_GRAPH_PATH, "evaluator_name": "execution"},
+        {keys.CREATE_NODES: nodes, keys.CONNECT: connects, keys.SET_VALUES: values},
+    )
     # 어떤 카메라로 렌더할지 (relationship 이라 SET_VALUES 대신 직접 지정)
     stage = omni.usd.get_context().get_stage()
-    rel = stage.GetPrimAtPath("/ActionGraph_Camera/RenderProduct").GetRelationship("inputs:cameraPrim")
-    rel.SetTargets([Sdf.Path(camera_path)])
-    print(f"[카메라] {camera_path} -> /{RGB_TOPIC} ({CAM_WIDTH}x{CAM_HEIGHT})")
+    targets = [("RenderProduct", camera_path)] + ([("RenderProductLeft", left_path)] if left_path else [])
+    for node_name, cam in targets:
+        rel = stage.GetPrimAtPath(f"{CAMERA_GRAPH_PATH}/{node_name}").GetRelationship("inputs:cameraPrim")
+        rel.SetTargets([Sdf.Path(cam)])
+
+    topics = [RGB_TOPIC, DEPTH_TOPIC, CAMERA_INFO_TOPIC] + ([RGB_LEFT_TOPIC] if left_path else [])
+    print(f"[카메라] {camera_path} -> " + ", ".join(f"/{t}" for t in topics) + f" ({CAM_WIDTH}x{CAM_HEIGHT})")
+    if left_path:
+        print(f"[카메라] 왼쪽 {left_path} -> /{RGB_LEFT_TOPIC}")
+
+
+def find_left_camera():
+    """연습 문제의 D455 왼쪽 카메라. USD 에 없으면 None (그러면 /rgb_left 는 발행하지 않는다)"""
+    stage = omni.usd.get_context().get_stage()
+    if stage.GetPrimAtPath(CAMERA_LEFT_PRIM).IsValid():
+        return CAMERA_LEFT_PRIM
+    print(f"[카메라] 왼쪽 카메라가 없다: {CAMERA_LEFT_PRIM} -> /{RGB_LEFT_TOPIC} 는 건너뛴다")
+    return None
 
 
 # ------------------------------------------------------------
@@ -383,7 +476,8 @@ task = ColorSortTask(name="color_sort")
 world.add_task(task)
 world.reset()  # set_up_scene() -> post_reset() (여기서 첫 랜덤 배치)
 
-create_camera_graph(find_wrist_camera())
+create_clock_graph()                                      # R1: /clock
+create_camera_graph(find_wrist_camera(), find_left_camera())  # R2: /rgb, /depth, /camera_info, /rgb_left
 listener = ColorIdListener()
 
 robot = world.scene.get_object(task.get_params()["robot_name"]["value"])
